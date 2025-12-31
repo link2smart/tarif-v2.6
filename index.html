@@ -283,6 +283,7 @@
                 setView('login');
                 setLoginForm({ username: '', password: '' });
                 setSearchQuery('');
+                setActiveTab('search'); // Réinitialisation de l'onglet actif
             };
 
             const openFile = async (path) => {
@@ -299,6 +300,44 @@
                 setUsers(updatedUsers);
             };
 
+            // SUPPRESSION ENTREE (Tarif ou Fiche)
+            const handleDeleteEntry = async (type, id, name) => {
+                if(!confirm(`Êtes-vous sûr de vouloir supprimer "${name}" de l'index ?\nCela ne supprime pas le fichier sur Dropbox, seulement l'entrée dans l'application.`)) return;
+                
+                setSyncStatus('working');
+                setSyncLog(`Suppression index : ${name}...`);
+
+                let newTarifs = [...tarifs];
+                let newFiches = [...fiches];
+
+                if(type === 'tarif') {
+                    newTarifs = newTarifs.filter(t => t.id !== id);
+                    setTarifs(newTarifs);
+                } else {
+                    newFiches = newFiches.filter(f => f.id !== id);
+                    setFiches(newFiches);
+                }
+
+                // Mise à jour de la DB Cloud pour tous
+                try {
+                    const metaInfo = {
+                        date: new Date().toLocaleString(),
+                        user: currentUser.name,
+                        action: `Suppression index : ${name}`
+                    };
+                    setDbMeta(metaInfo);
+
+                    const dbExport = { meta: metaInfo, history: dbHistory, tarifs: newTarifs, fiches: newFiches };
+                    await dbxUploadFile(dbxConfig.token, '/db_tarifs.json', new Blob([JSON.stringify(dbExport)], { type: 'application/json' }));
+                    
+                    setSyncLog(`✅ Entrée "${name}" supprimée de la base.`);
+                    setSyncStatus('success');
+                } catch(e) {
+                    setSyncLog(`❌ Erreur MAJ Cloud après suppression : ${e.message}`);
+                    setSyncStatus('error');
+                }
+            };
+
             // Upload Fiche
             const handleUploadFiche = async (e) => {
                 const file = e.target.files[0];
@@ -309,7 +348,16 @@
                 try {
                     const targetPath = `${dbxConfig.pathFT || '/Fiches'}/${file.name}`;
                     await dbxUploadFile(dbxConfig.token, targetPath, file);
-                    const newFiche = { id: 'local_' + Date.now(), name: file.name, path: targetPath, type: 'ft', server_modified: new Date().toISOString() };
+                    
+                    // Ajout index_date pour cohérence
+                    const newFiche = { 
+                        id: 'local_' + Date.now(), 
+                        name: file.name, 
+                        path: targetPath, 
+                        type: 'ft', 
+                        server_modified: new Date().toISOString(),
+                        index_date: new Date().toLocaleString() 
+                    };
                     setFiches(prev => [newFiche, ...prev]);
                     alert(`Fiche "${file.name}" ajoutée !`);
                 } catch (err) { alert("Erreur upload: " + err.message); } finally { setIsUploading(false); if(uploadInputRef.current) uploadInputRef.current.value = ''; }
@@ -434,8 +482,14 @@
                     if (dbxConfig.pathFT) {
                         try {
                             const listFT = await dbxListFolder(dbxConfig.token, dbxConfig.pathFT);
+                            // Ajout de index_date pour les fiches lors du scan
                             currentFiches = listFT.entries.filter(e => e['.tag'] === 'file').map(f => ({
-                                id: f.id, name: f.name, path: f.path_lower, type: 'ft', server_modified: f.server_modified
+                                id: f.id, 
+                                name: f.name, 
+                                path: f.path_lower, 
+                                type: 'ft', 
+                                server_modified: f.server_modified,
+                                index_date: new Date().toLocaleString() // Date actuelle du scan
                             }));
                             setFiches(currentFiches);
                         } catch(e) {}
@@ -696,7 +750,7 @@
                             </div>
                         )}
 
-                        {activeTab === 'admin' && (
+                        {activeTab === 'admin' && currentUser.role === 'admin' && (
                             <div className="animate-fade grid grid-cols-1 lg:grid-cols-3 gap-8">
                                 <div className="lg:col-span-1 space-y-6">
                                     <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
@@ -721,11 +775,41 @@
                                     <div className="flex-1 overflow-auto p-0">
                                         <table className="w-full text-sm text-left">
                                             <thead className="bg-white sticky top-0 shadow-sm text-slate-500 font-bold text-[10px] uppercase">
-                                                <tr><th className="p-4">Fichier</th><th className="p-4">Type</th><th className="p-4 text-center">Info</th></tr>
+                                                <tr>
+                                                    <th className="p-4">Fichier</th>
+                                                    <th className="p-4">Type</th>
+                                                    <th className="p-4">Date Ajout</th>
+                                                    <th className="p-4 text-center">Info</th>
+                                                    <th className="p-4 text-right">Actions</th>
+                                                </tr>
                                             </thead>
                                             <tbody className="divide-y divide-slate-50">
-                                                {tarifs.map(t => (<tr key={t.id} className="hover:bg-blue-50/30"><td className="p-4 font-bold text-slate-700">{t.name}</td><td className="p-4"><span className="bg-green-100 text-green-700 px-2 py-1 rounded text-xs font-bold">TARIF</span></td><td className="p-4 text-center text-blue-600 font-bold">{t.products?.length} produits</td></tr>))}
-                                                {fiches.map(f => (<tr key={f.id} className="hover:bg-indigo-50/30"><td className="p-4 font-bold text-slate-700">{f.name}</td><td className="p-4"><span className="bg-indigo-100 text-indigo-700 px-2 py-1 rounded text-xs font-bold">FICHE</span></td><td className="p-4 text-center text-slate-400">PDF</td></tr>))}
+                                                {tarifs.map(t => (
+                                                    <tr key={t.id} className="hover:bg-blue-50/30 group">
+                                                        <td className="p-4 font-bold text-slate-700 max-w-[200px] truncate" title={t.name}>{t.name}</td>
+                                                        <td className="p-4"><span className="bg-green-100 text-green-700 px-2 py-1 rounded text-xs font-bold">TARIF</span></td>
+                                                        <td className="p-4 text-slate-500 text-xs font-mono">{t.index_date ? t.index_date.split(' ')[0] : '-'}</td>
+                                                        <td className="p-4 text-center text-blue-600 font-bold">{t.products?.length} produits</td>
+                                                        <td className="p-4 text-right">
+                                                            <button onClick={() => handleDeleteEntry('tarif', t.id, t.name)} className="text-slate-300 hover:text-red-500 transition-colors p-2" title="Supprimer de l'index">
+                                                                <Icon name="Trash2" size={16}/>
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                                {fiches.map(f => (
+                                                    <tr key={f.id} className="hover:bg-indigo-50/30 group">
+                                                        <td className="p-4 font-bold text-slate-700 max-w-[200px] truncate" title={f.name}>{f.name}</td>
+                                                        <td className="p-4"><span className="bg-indigo-100 text-indigo-700 px-2 py-1 rounded text-xs font-bold">FICHE</span></td>
+                                                        <td className="p-4 text-slate-500 text-xs font-mono">{f.index_date ? f.index_date.split(' ')[0] : (f.server_modified ? new Date(f.server_modified).toLocaleDateString() : '-')}</td>
+                                                        <td className="p-4 text-center text-slate-400">PDF</td>
+                                                        <td className="p-4 text-right">
+                                                            <button onClick={() => handleDeleteEntry('fiche', f.id, f.name)} className="text-slate-300 hover:text-red-500 transition-colors p-2" title="Supprimer de l'index">
+                                                                <Icon name="Trash2" size={16}/>
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                ))}
                                             </tbody>
                                         </table>
                                     </div>
@@ -733,7 +817,7 @@
                             </div>
                         )}
 
-                        {activeTab === 'users' && (
+                        {activeTab === 'users' && currentUser.role === 'admin' && (
                             <div className="max-w-xl mx-auto space-y-8 animate-fade">
                                 <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
                                     <h3 className="font-bold text-lg mb-6 flex items-center gap-2"><Icon name={editingUserIdx !== null ? "Edit" : "UserPlus"}/> {editingUserIdx !== null ? "Modifier" : "Créer un accès"}</h3>
