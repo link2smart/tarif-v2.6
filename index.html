@@ -604,7 +604,12 @@
                         canvas.width = viewport.width;
                         await page.render({ canvasContext: ctx, viewport }).promise;
                         const base64Img = canvas.toDataURL('image/png').split(',')[1];
-                        let prompt = i === 1 ? `Analyse page ${i}. Cherche date (format JJ/MM/AAAA) sinon "${filenameDate}". JSON: { "date_tarif": "...", "products": [ {"name": "...", "price": "...", "unit": "..."} ] }` : `Analyse page ${i}. JSON produits uniquement: { "products": [ {"name": "...", "price": "...", "unit": "..."} ] }`;
+                        
+                        // MISE A JOUR DU PROMPT POUR L'ASTERISQUE (*)
+                        let prompt = i === 1 
+                            ? `Analyse page ${i}. Cherche date (format JJ/MM/AAAA) sinon "${filenameDate}". IMPORTANT: Si un produit a un astérisque (*) avant ou après son nom, GARDE-LE dans le champ "name" (ex: "Produit *"). JSON: { "date_tarif": "...", "products": [ {"name": "...", "price": "...", "unit": "..."} ] }` 
+                            : `Analyse page ${i}. IMPORTANT: Si un produit a un astérisque (*) avant ou après son nom, GARDE-LE dans le champ "name". JSON produits uniquement: { "products": [ {"name": "...", "price": "...", "unit": "..."} ] }`;
+                        
                         if (i > 1) await delay(1000);
                         try {
                             const result = await callIA({ contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Img } } ] }], generationConfig: { responseMimeType: "application/json" } }, dbxConfig.geminiKey);
@@ -682,12 +687,44 @@
                 } catch(e) { setSyncLog("Erreur Sync: " + e.message); setSyncStatus('error'); }
             };
 
+            // MODIFICATION: AJOUT SUPPRESSION TOTALE
+            const handleDeleteAllTarifs = async () => {
+                if(!confirm("ATTENTION : Cela va supprimer TOUS les tarifs de l'index (la base de données). Les fichiers PDF sur Dropbox ne seront PAS effacés. Continuer ?")) return;
+                setSyncStatus('working');
+                try {
+                    const newHistoryEntry = { date: new Date().toLocaleString(), user: currentUser.name, action: "Suppression Totale des Tarifs" };
+                    const updatedHistory = [newHistoryEntry, ...dbHistory].slice(0, 10);
+                    setDbHistory(updatedHistory);
+                    
+                    setTarifs([]); // Clear local
+                    
+                    await saveToCloud([], fiches, updatedHistory, users); // Save empty array
+                    setSyncLog("✅ Tous les tarifs ont été supprimés de l'index.");
+                    setSyncStatus('success');
+                } catch(e) {
+                    setSyncLog("❌ Erreur suppression totale : " + e.message);
+                    setSyncStatus('error');
+                    alert("Erreur : " + e.message);
+                    // Reload to restore state if failed
+                    loadCloudDatabase(true);
+                }
+            };
+
+            // MODIFICATION: AMELIORATION SUPPRESSION UNITAIRE (ROLLBACK EN CAS D'ERREUR)
             const handleDeleteEntry = async (type, id, name) => {
                 if(!confirm(`Supprimer "${name}" ?`)) return;
                 setSyncStatus('working');
+                
+                // Optimistic UI Update (On sauvegarde l'état avant modif)
+                const prevTarifs = [...tarifs];
+                const prevFiches = [...fiches];
+                
                 let newTarifs = type === 'tarif' ? tarifs.filter(t => t.id !== id) : tarifs;
                 let newFiches = type === 'fiche' ? fiches.filter(f => f.id !== id) : fiches;
-                setTarifs(newTarifs); setFiches(newFiches);
+                
+                setTarifs(newTarifs); 
+                setFiches(newFiches);
+                
                 try {
                     const newHistoryEntry = { date: new Date().toLocaleString(), user: currentUser.name, action: `Suppression : ${name}` };
                     const updatedHistory = [newHistoryEntry, ...dbHistory].slice(0, 10);
@@ -695,7 +732,14 @@
                     await saveToCloud(newTarifs, newFiches, updatedHistory, users);
                     setSyncLog(`✅ "${name}" supprimé.`);
                     setSyncStatus('success');
-                } catch(e) { setSyncLog("Err delete: " + e.message); setSyncStatus('error'); }
+                } catch(e) { 
+                    setSyncLog("Err delete: " + e.message); 
+                    setSyncStatus('error'); 
+                    alert("Echec de la suppression sur le Cloud : " + e.message + "\nL'élément a été restauré.");
+                    // Rollback (Annulation si échec)
+                    setTarifs(prevTarifs);
+                    setFiches(prevFiches);
+                }
             };
 
             const handleUserSubmit = async (e) => {
@@ -994,24 +1038,45 @@
                                             <div className="animate-fade">
                                                 <h3 className="text-sm font-bold uppercase text-slate-400 mb-4 pl-2 flex items-center gap-2"><Icon name="Box" size={16}/> Tarifs ({searchResults.products.length})</h3>
                                                 <div className="space-y-3">
-                                                    {searchResults.products.map((res, i) => (
-                                                        <div key={i} className="bg-white p-5 rounded-2xl border border-slate-100 hover:border-blue-300 hover:shadow-lg transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 group">
-                                                            <div className="flex items-start gap-4">
-                                                                <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 bg-blue-50 text-blue-600"><Icon name="Tag" size={20}/></div>
-                                                                <div>
-                                                                    <div className="font-bold text-slate-800 text-lg">{res.name}</div>
-                                                                    <div className="flex flex-wrap items-center gap-2 mt-2">
-                                                                        <span className="bg-slate-100 px-2.5 py-1 rounded-lg text-xs font-bold text-slate-600 flex items-center gap-1"><Icon name="Folder" size={12}/> {res.source}</span>
-                                                                        <span className="px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 bg-green-50 text-green-600 border border-green-100"><Icon name="Calendar" size={12}/> {res.date_tarif}</span>
+                                                    {searchResults.products.map((res, i) => {
+                                                        // LOGIQUE TVA CORRIGÉE (Asterisk avant OU après)
+                                                        const isTaxable = res.name && (res.name.trim().startsWith('*') || res.name.trim().endsWith('*'));
+                                                        const priceVal = parseFloat(String(res.price).replace(/[^0-9.]/g, ''));
+                                                        const validPrice = !isNaN(priceVal);
+                                                        const priceHT = validPrice ? priceVal.toFixed(2) : res.price;
+                                                        const priceTTC = validPrice ? (priceVal * 1.20).toFixed(2) : null;
+
+                                                        return (
+                                                            <div key={i} className="bg-white p-5 rounded-2xl border border-slate-100 hover:border-blue-300 hover:shadow-lg transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 group">
+                                                                <div className="flex items-start gap-4">
+                                                                    <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 bg-blue-50 text-blue-600"><Icon name="Tag" size={20}/></div>
+                                                                    <div>
+                                                                        <div className="font-bold text-slate-800 text-lg">{res.name}</div>
+                                                                        <div className="flex flex-wrap items-center gap-2 mt-2">
+                                                                            <span className="bg-slate-100 px-2.5 py-1 rounded-lg text-xs font-bold text-slate-600 flex items-center gap-1"><Icon name="Folder" size={12}/> {res.source}</span>
+                                                                            <span className="px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 bg-green-50 text-green-600 border border-green-100"><Icon name="Calendar" size={12}/> {res.date_tarif}</span>
+                                                                        </div>
                                                                     </div>
                                                                 </div>
+                                                                <div className="flex items-center justify-between md:justify-end gap-3 pl-14 md:pl-0">
+                                                                    <div className="text-right mr-4">
+                                                                        {validPrice && isTaxable ? (
+                                                                            <div className="flex flex-col items-end">
+                                                                                <div className="text-sm font-bold text-slate-400">{priceHT} <span className="text-[10px]">HT</span></div>
+                                                                                <div className="text-2xl font-black text-blue-600 whitespace-nowrap">{priceTTC} <span className="text-xs text-slate-400 font-bold">TTC</span></div>
+                                                                            </div>
+                                                                        ) : (
+                                                                            <div className="text-2xl font-black text-green-600 whitespace-nowrap">
+                                                                                {priceHT} <span className="text-xs text-green-800 font-bold">{validPrice ? 'EXO' : (res.unit || 'DH')}</span>
+                                                                            </div>
+                                                                        )}
+                                                                        {validPrice && <div className="text-xs text-slate-400 font-bold mt-1 text-right">{res.unit || 'DH'}</div>}
+                                                                    </div>
+                                                                    <button onClick={() => openFile(res.path, res.source)} className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-sm"><Icon name="Eye" size={14}/> Voir</button>
+                                                                </div>
                                                             </div>
-                                                            <div className="flex items-center justify-between md:justify-end gap-3 pl-14 md:pl-0">
-                                                                <div className="text-2xl font-black text-blue-600 whitespace-nowrap mr-4">{res.price} <span className="text-xs text-slate-400 font-bold">{res.unit || 'DH'}</span></div>
-                                                                <button onClick={() => openFile(res.path, res.source)} className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-sm"><Icon name="Eye" size={14}/> Voir</button>
-                                                            </div>
-                                                        </div>
-                                                    ))}
+                                                        );
+                                                    })}
                                                 </div>
                                             </div>
                                         )}
@@ -1103,6 +1168,7 @@
                                         <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
                                             <h3 className="font-bold text-lg text-slate-800">Indexation</h3>
                                             <div className="flex gap-2">
+                                                <button onClick={handleDeleteAllTarifs} className="bg-red-50 hover:bg-red-100 text-red-600 px-3 py-2 rounded-xl font-bold text-xs flex items-center gap-1 transition-colors"><Icon name="Trash2" size={14}/> Tout Supprimer</button>
                                                 <button onClick={() => { setAdminUploadMode('new'); setShowAdminUploadModal(true); }} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-indigo-200 transition-all active:scale-95"><Icon name="Plus"/> Gestion Tarifs</button>
                                                 <button onClick={() => runFullSync(false)} disabled={syncStatus === 'working'} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-blue-200 transition-all active:scale-95 disabled:opacity-50"><Icon name={syncStatus === 'working' ? "Loader2" : "RefreshCw"} className={syncStatus === 'working' ? "animate-spin" : ""}/> Re-Scan Global</button>
                                             </div>
